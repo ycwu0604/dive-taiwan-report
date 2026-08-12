@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from html import escape
 
@@ -21,26 +22,26 @@ def _curl_available() -> bool:
 
 USE_CURL = _curl_available()
 
-def fetch_text(url: str, timeout: int = 15) -> str:
+def fetch_text(url: str, timeout: int = 5) -> str:
+    """Fetch URL text. Tries curl first, then urllib. No retry — if curl fails with timeout, skip urllib too."""
     if USE_CURL:
         try:
             r = subprocess.run(
                 ["curl.exe", "-sS", "--ssl-no-revoke", "-k", "--max-time", str(timeout), url],
-                capture_output=True, timeout=timeout + 5)
+                capture_output=True, timeout=timeout + 3)
             if r.returncode == 0 and r.stdout:
                 return r.stdout.decode("utf-8", errors="replace")
-            if r.stderr:
-                err = r.stderr.decode("utf-8", errors="replace").strip()
-                if err:
-                    print(f"[WARN] curl stderr: {url} → {err[:120]}")
-        except Exception as e:
-            print(f"[WARN] curl exception: {url} → {e}")
+            # curl timeout → don't retry urllib (same network path)
+            if r.returncode != 0:
+                return ""
+        except Exception:
+            return ""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "DiveTaiwan/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        print(f"[WARN] urllib failed: {url} → {e}")
+    except Exception:
+        pass
     return ""
 
 def fetch_json(url: str, timeout: int = 20) -> dict:
@@ -285,6 +286,67 @@ DIVES = [
         "depth": "15-35m",
         "level": "中~進階",
         "feature": "巨岩地形·珊瑚花園·放流",
+    },
+    # ── 小琉球 ──
+    {
+        "id": "meirendong",
+        "name": "美人洞",
+        "region": "xl",
+        "county": "屏東琉球",
+        "facing": "NW",
+        "terrain": "岸潛",
+        "shelter": 0.6,   # 西北側有礁遮擋
+        "lat": 22.355, "lon": 120.385,
+        "off_lat": 22.36, "off_lon": 120.37,
+        "sid": "1001322C01",   # 琉球鄉_北方
+        "depth": "3-18m",
+        "level": "初級",
+        "feature": "海龜·軟珊瑚·入門潛點",
+    },
+    {
+        "id": "shanfu",
+        "name": "杉福漁港",
+        "region": "xl",
+        "county": "屏東琉球",
+        "facing": "W",
+        "terrain": "岸潛",
+        "shelter": 0.5,   # 港內遮蔽高
+        "lat": 22.345, "lon": 120.375,
+        "off_lat": 22.34, "off_lon": 120.36,
+        "sid": "1001322C02",   # 琉球鄉_南方
+        "depth": "3-15m",
+        "level": "初級",
+        "feature": "港內入門·微距·夜潛",
+    },
+    {
+        "id": "longxiadong",
+        "name": "龍蝦洞",
+        "region": "xl",
+        "county": "屏東琉球",
+        "facing": "SE",
+        "terrain": "岸潛",
+        "shelter": 0.8,   # 東南側部分遮擋
+        "lat": 22.33, "lon": 120.395,
+        "off_lat": 22.32, "off_lon": 120.40,
+        "sid": "1001322C02",   # 琉球鄉_南方
+        "depth": "5-20m",
+        "level": "初~中級",
+        "feature": "珊瑚礁·龍蝦·海蛞蝓",
+    },
+    {
+        "id": "houshi",
+        "name": "厚石群礁",
+        "region": "xl",
+        "county": "屏東琉球",
+        "facing": "S",
+        "terrain": "岸潛",
+        "shelter": 0.7,   # 南側有礁遮擋
+        "lat": 22.335, "lon": 120.385,
+        "off_lat": 22.33, "off_lon": 120.39,
+        "sid": "1001322C02",   # 琉球鄉_南方
+        "depth": "5-25m",
+        "level": "中級",
+        "feature": "群礁地形·海龜·放流",
     },
 ]
 
@@ -589,23 +651,58 @@ def generate_report() -> str:
     today_label = f"{now.month}/{now.day} ({WEEKDAY_TW[now.weekday()]})"
 
     # Fetch CWA data (group by SID to avoid duplicate requests)
+    # Quick probe: if first SID times out, skip all CWA (rely on Open-Meteo only)
     unique_sids = list({d["sid"] for d in DIVES})
     cwa_days_by_sid: dict[str, dict] = {}
     tide_by_sid: dict[str, dict[str, list[dict]]] = {}
 
-    for sid in unique_sids:
-        cwa_html = fetch_text(f"https://www.cwa.gov.tw/V8/C/M/TownCoastal/MOD/3hr/{sid}.html")
-        cwa_rows = parse_cwa_3hr(cwa_html)
-        cwa_days_by_sid[sid] = group_by_day(cwa_rows)
+    cwa_available = True
+    # Quick probe first SID
+    probe = fetch_text(f"https://www.cwa.gov.tw/V8/C/M/TownCoastal/MOD/3hr/{unique_sids[0]}.html")
+    if not probe:
+        print(f"[INFO] CWA probe failed for {unique_sids[0]}, skipping all CWA fetches")
+        cwa_available = False
 
+    if cwa_available:
+        # Parse the probe result
+        cwa_days_by_sid[unique_sids[0]] = group_by_day(parse_cwa_3hr(probe))
+
+        def _fetch_sid(sid: str):
+            cwa_html = fetch_text(f"https://www.cwa.gov.tw/V8/C/M/TownCoastal/MOD/3hr/{sid}.html")
+            cwa_rows = parse_cwa_3hr(cwa_html)
+            cwa_days = group_by_day(cwa_rows)
+
+            tide_all = []
+            for d in range(1, 6):
+                tide_html = fetch_text(
+                    f"https://www.cwa.gov.tw/V8/C/M/TownCoastal/MOD/Tide/{sid}_Day{d}.html")
+                tide_all.extend(parse_cwa_tide(tide_html, day_offset=d))
+            tide_dict: dict[str, list[dict]] = {}
+            for t in tide_all:
+                tide_dict.setdefault(t["date"], []).append(t)
+
+            return sid, cwa_days, tide_dict
+
+        remaining_sids = unique_sids[1:]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_fetch_sid, sid): sid for sid in remaining_sids}
+            for future in as_completed(futures):
+                try:
+                    sid, cwa_days, tide_dict = future.result()
+                    cwa_days_by_sid[sid] = cwa_days
+                    tide_by_sid[sid] = tide_dict
+                except Exception:
+                    pass
+
+        # Also fetch tide for the first SID
         tide_all = []
         for d in range(1, 6):
             tide_html = fetch_text(
-                f"https://www.cwa.gov.tw/V8/C/M/TownCoastal/MOD/Tide/{sid}_Day{d}.html")
+                f"https://www.cwa.gov.tw/V8/C/M/TownCoastal/MOD/Tide/{unique_sids[0]}_Day{d}.html")
             tide_all.extend(parse_cwa_tide(tide_html, day_offset=d))
-        tide_by_sid[sid] = {}
+        tide_by_sid[unique_sids[0]] = {}
         for t in tide_all:
-            tide_by_sid[sid].setdefault(t["date"], []).append(t)
+            tide_by_sid[unique_sids[0]].setdefault(t["date"], []).append(t)
 
     all_dives_data = []
 
@@ -801,7 +898,7 @@ def render_html(now, today_label, ranking, all_dives_data) -> str:
           <td class="rank-rating">{r['rating']}</td>
         </tr>"""
 
-    REGION_LABELS = {"ne": "🌊 東北角", "kt": "🌴 墾丁", "gi": "🏝️ 綠島", "ly": "🌋 蘭嶼"}
+    REGION_LABELS = {"ne": "🌊 東北角", "kt": "🌴 墾丁", "gi": "🏝️ 綠島", "ly": "🌋 蘭嶼", "xl": "🐚 小琉球"}
     current_region = ""
 
     dive_cards = ""
@@ -900,6 +997,14 @@ def render_html(now, today_label, ranking, all_dives_data) -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>潛點台灣 · {escape(today_label)}</title>
+<!-- Google Analytics -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-QGMF7QK839"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){{dataLayer.push(arguments);}}
+  gtag('js', new Date());
+  gtag('config', 'G-QGMF7QK839');
+</script>
 <style>
 :root {{
   --bg: #051520; --card: #0c2636; --card2: #133a4e;
@@ -941,10 +1046,12 @@ a {{ color:var(--accent); }}
 .spot-card.region-kt {{ background:rgba(50,20,10,.45); border-color:rgba(220,140,60,.25); }}
 .spot-card.region-gi {{ background:rgba(10,40,30,.5); border-color:rgba(0,200,120,.25); }}
 .spot-card.region-ly {{ background:rgba(40,15,15,.5); border-color:rgba(200,80,80,.25); }}
+.spot-card.region-xl {{ background:rgba(10,35,40,.5); border-color:rgba(0,180,200,.25); }}
 .spot-card.region-ne .spot-head:hover {{ background:rgba(60,140,220,.08); }}
 .spot-card.region-kt .spot-head:hover {{ background:rgba(220,140,60,.08); }}
 .spot-card.region-gi .spot-head:hover {{ background:rgba(0,200,120,.08); }}
 .spot-card.region-ly .spot-head:hover {{ background:rgba(200,80,80,.08); }}
+.spot-card.region-xl .spot-head:hover {{ background:rgba(0,180,200,.08); }}
 .region-sep {{ font-size:1.1rem; font-weight:700; padding:14px 0 4px; color:var(--accent); letter-spacing:1px; }}
 .spot-head {{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; padding:12px 14px; cursor:pointer; user-select:none; }}
 .spot-head:hover {{ background:rgba(0,229,255,.04); }}
@@ -1026,7 +1133,7 @@ a {{ color:var(--accent); }}
 
 <div class="hero">
   <h1>🤿 潛點台灣</h1>
-  <p class="sub">東北角 + 墾丁 + 綠島 + 蘭嶼 15 潛點 · {escape(today_label)} · 4 日預報</p>
+  <p class="sub">東北角 + 墾丁 + 綠島 + 蘭嶼 + 小琉球 19 潛點 · {escape(today_label)} · 4 日預報</p>
   <p class="meta">CWA 鄉鎮沿海 + Open-Meteo Marine · 產生時間 {escape(generated)}</p>
 </div>
 
